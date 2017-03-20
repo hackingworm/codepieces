@@ -1,0 +1,19 @@
+declare -i sum=0
+declare -i number
+
+while [ true ]
+do
+	read str
+
+	if [ "" == "$str" ]
+	then
+		break;
+	fi
+
+	#echo $str
+	number=$str
+	#echo $number
+	sum=$sum+$number
+done
+
+echo $sum
