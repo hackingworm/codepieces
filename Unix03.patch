@@ -1,0 +1,566 @@
+diff --git a/drivers/tty/pty.c b/drivers/tty/pty.c
+index abfd990..2c944ca 100644
+--- a/drivers/tty/pty.c
++++ b/drivers/tty/pty.c
+@@ -267,8 +267,16 @@ out:
+ static void pty_set_termios(struct tty_struct *tty,
+ 					struct ktermios *old_termios)
+ {
++	/*
++	 * Unix 03, fix the case tcsetattr 8 in VSX4
++	 *
++	 * Dont keep certain flags in c_cflag. The change is for, and only for
++	 * Unix 03 comformance. Potential side effect isnt evaluated.
++	 */
++	/*
+ 	tty->termios.c_cflag &= ~(CSIZE | PARENB);
+ 	tty->termios.c_cflag |= (CS8 | CREAD);
++	*/
+ }
+ 
+ /**
+diff --git a/fs/fcntl.c b/fs/fcntl.c
+index 6599222..25c9441 100644
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -26,7 +26,15 @@
+ #include <asm/siginfo.h>
+ #include <asm/uaccess.h>
+ 
+-#define SETFL_MASK (O_APPEND | O_NONBLOCK | O_NDELAY | O_DIRECT | O_NOATIME)
++/*
++ * Unix03, fix the cases fcntl_X 2&3 in VSX4
++ *
++ * Curently, only setting of following flags supported in Linux:
++ *	O_APPEND, O_NONBLOCK, O_NDELAY, O_DIRECT, O_NOATIME
++ * For, and only for  Unix 03 conformance, setting O_SYNC is also added.
++ * Please pay attention that there might be unexpected side effects.
++ */
++#define SETFL_MASK (O_APPEND | O_NONBLOCK | O_NDELAY | O_DIRECT | O_NOATIME | O_SYNC)
+ 
+ static int setfl(int fd, struct file * filp, unsigned long arg)
+ {
+@@ -56,6 +64,10 @@ static int setfl(int fd, struct file * filp, unsigned long arg)
+ 				return -EINVAL;
+ 	}
+ 
++	if (unlikely((arg & O_SYNC) && !filp->f_op->fsync)) {
++		return -EINVAL;
++	}
++
+ 	if (filp->f_op && filp->f_op->check_flags)
+ 		error = filp->f_op->check_flags(arg);
+ 	if (error)
+diff --git a/fs/namei.c b/fs/namei.c
+index fb99721..d1f4ca0 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -3646,9 +3646,95 @@ exit1:
+ 	return error;
+ }
+ 
++static long do_unlinkat(int dfd, const char __user *pathname);
++
++static inline char *cut_trailing_slashes(const char __user *pathname) {
++	int index = strlen(pathname) - 1;
++	char *npathname;
++
++	while ('/' == pathname[index] && 0 <= index) {
++		index--;
++	}
++
++	index++;
++	if (unlikely('/' == pathname[index] && 0 < index)) {
++		if (unlikely(NULL ==  (npathname = (char*)kmalloc(index + 1, GFP_KERNEL)))) {
++			return NULL;
++		}
++
++		strncpy(npathname, pathname, index);
++		npathname[index] = '\0';
++		return npathname;
++	} else {
++		return (char*)pathname;
++	}
++}
++
++static inline char *readlink(const char *pathname) {
++	char *rpathname;
++	int size;
++
++	if (unlikely(NULL == (rpathname = (char*)__get_free_page(GFP_KERNEL)))) {
++		return NULL;
++	}
++
++	if (unlikely(0 > (size = sys_readlinkat(AT_FDCWD, pathname, rpathname, PAGE_SIZE - 1)))) {
++		free_page((unsigned long)rpathname);
++		return NULL;
++	}
++
++	rpathname[size] = '\0';
++	return rpathname;
++}
++
+ SYSCALL_DEFINE1(rmdir, const char __user *, pathname)
+ {
+-	return do_rmdir(AT_FDCWD, pathname);
++	/*
++	 * Unix03, fix the rmdir relevant cases in VSX4
++	 *
++	 * Follow symlink whenever necessary
++	 */
++
++	struct kstat stat;
++	int error;
++	char *npathname, *rpathname;
++	mm_segment_t oldfs;
++
++	if (unlikely(NULL == (npathname = cut_trailing_slashes(pathname)))) {
++		error = -ENOMEM;
++		goto exit1;
++	}
++
++	oldfs = get_fs();
++	set_fs(KERNEL_DS);
++
++	if (unlikely(error = vfs_fstatat(AT_FDCWD, npathname, &stat, AT_SYMLINK_NOFOLLOW))) {
++		goto exit2;
++	}
++
++	rpathname = npathname;
++	if (unlikely(S_ISLNK(stat.mode)
++		&& ('/' != pathname[strlen(pathname) - 1]
++		|| NULL == (rpathname = readlink(npathname))))) {
++		error = -ENOTDIR;
++		goto exit2;
++	}
++
++	if (unlikely(error = do_rmdir(AT_FDCWD, rpathname))) {
++		goto exit3;
++	}
++
++exit3:
++	if (unlikely(npathname != rpathname)) {
++		free_page((unsigned long)rpathname);
++	}
++exit2:
++	set_fs(oldfs);
++	if (unlikely(pathname != npathname)) {
++		kfree(npathname);
++	}
++exit1:
++	return error;
+ }
+ 
+ /**
+@@ -3750,6 +3836,20 @@ retry_deleg:
+ 		if (error)
+ 			goto exit2;
+ 		error = vfs_unlink(nd.path.dentry->d_inode, dentry, &delegated_inode);
++		/*
++		 * Unix03, fix the case unlink 19 in VSX4
++		 *
++		 * When unlink a directory, set error code into -EPERM instead
++		 * of -EISDIR
++		 *
++		 * A special scenario:
++		 * 	For init process, still set error code into -EISDIR;
++		 *	otherwise, it hangs during bootstrap in some Linux
++		 *	clones
++		 */
++		if (-EISDIR == error && 1 < current->pid) {
++			error = -EPERM;
++		}
+ exit2:
+ 		dput(dentry);
+ 	}
+@@ -3938,6 +4038,9 @@ SYSCALL_DEFINE5(linkat, int, olddfd, const char __user *, oldname,
+ 	struct inode *delegated_inode = NULL;
+ 	int how = 0;
+ 	int error;
++	char *roldname;
++	struct kstat stat;
++	mm_segment_t oldfs;
+ 
+ 	if ((flags & ~(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH)) != 0)
+ 		return -EINVAL;
+@@ -3954,10 +4057,30 @@ SYSCALL_DEFINE5(linkat, int, olddfd, const char __user *, oldname,
+ 
+ 	if (flags & AT_SYMLINK_FOLLOW)
+ 		how |= LOOKUP_FOLLOW;
++
++	/*
++	 * Unix03, fix the case link 5 in VSU
++	 *
++	 * Follow the symlink
++	 */
++
++	if (unlikely(error = vfs_fstatat(olddfd, oldname, &stat,
++				AT_SYMLINK_NOFOLLOW))) {
++		goto exit1;
++	}
++
++	oldfs = get_fs();
++	set_fs(KERNEL_DS);
++
++	roldname = (char*)oldname;
++	if (unlikely(S_ISLNK(stat.mode)
++		&& NULL == (roldname = readlink(oldname)))) {
++		roldname = (char*)oldname;
++	}
+ retry:
+-	error = user_path_at(olddfd, oldname, how, &old_path);
++	error = user_path_at(olddfd, roldname, how, &old_path);
+ 	if (error)
+-		return error;
++		goto exit2;
+ 
+ 	new_dentry = user_path_create(newdfd, newname, &new_path,
+ 					(how & LOOKUP_REVAL));
+@@ -3991,7 +4114,13 @@ out_dput:
+ 	}
+ out:
+ 	path_put(&old_path);
++exit2:
++	if (unlikely(oldname != roldname)) {
++		free_page((unsigned long)roldname);
++	}
+ 
++	set_fs(oldfs);
++exit1:
+ 	return error;
+ }
+ 
+@@ -4196,6 +4325,9 @@ SYSCALL_DEFINE5(renameat2, int, olddfd, const char __user *, oldname,
+ 	unsigned int lookup_flags = 0;
+ 	bool should_retry = false;
+ 	int error;
++	char *noldname, *roldname, *nnewname, *rnewname;
++	struct kstat stat;
++	mm_segment_t oldfs;
+ 
+ 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
+ 		return -EINVAL;
+@@ -4207,14 +4339,62 @@ SYSCALL_DEFINE5(renameat2, int, olddfd, const char __user *, oldname,
+ 	if ((flags & RENAME_WHITEOUT) && !capable(CAP_MKNOD))
+ 		return -EPERM;
+ 
++	/*
++	 * Unix03, fix the case rename 1 in VSX4
++	 *
++	 * Follow symlink whenever necessary
++	 */
++	if (unlikely(NULL == (noldname = cut_trailing_slashes(oldname)))) {
++		error = -ENOMEM;
++		goto exita;
++	}
++
++	if (unlikely(NULL == (nnewname = cut_trailing_slashes(newname)))) {
++		error = -ENOMEM;
++		goto exitb;
++	}
++
++	oldfs = get_fs();
++	set_fs(KERNEL_DS);
++
++	if (unlikely(
++		error = vfs_fstatat(olddfd, noldname, &stat, AT_SYMLINK_NOFOLLOW))) {
++		goto exitc;
++	}
++
++	roldname = noldname;
++	if (unlikely(S_ISLNK(stat.mode)
++		&& '/' == oldname[strlen(oldname) - 1]
++		&& NULL == (roldname = readlink(noldname)))) {
++		error = -ENOENT;
++		goto exitc;
++	}
++
++	rnewname = nnewname;
++
++	error = vfs_fstatat(newdfd, nnewname, &stat, AT_SYMLINK_NOFOLLOW);
++	if (likely(-ENOENT == error)) {
++		goto retry;
++	} else if (unlikely(0 != error)) {
++		goto exitd;
++	}
++
++	if (unlikely(S_ISLNK(stat.mode)
++		&& '/' == newname[strlen(newname) - 1]
++		&& NULL == (rnewname = readlink(nnewname)))) {
++		error = -ENOENT;
++		goto exitd;
++	}
++
+ retry:
+-	from = user_path_parent(olddfd, oldname, &oldnd, lookup_flags);
++	from = user_path_parent(olddfd, roldname, &oldnd, lookup_flags);
++
+ 	if (IS_ERR(from)) {
+ 		error = PTR_ERR(from);
+ 		goto exit;
+ 	}
+ 
+-	to = user_path_parent(newdfd, newname, &newnd, lookup_flags);
++	to = user_path_parent(newdfd, rnewname, &newnd, lookup_flags);
+ 	if (IS_ERR(to)) {
+ 		error = PTR_ERR(to);
+ 		goto exit1;
+@@ -4324,6 +4504,23 @@ exit1:
+ 		goto retry;
+ 	}
+ exit:
++	if (unlikely(nnewname != rnewname)) {
++		free_page((unsigned long)rnewname);
++	}
++exitd:
++	if (unlikely(noldname != roldname)) {
++		free_page((unsigned long)roldname);
++	}
++exitc:
++	set_fs(oldfs);
++	if (unlikely(newname != nnewname)) {
++		kfree(nnewname);
++	}
++exitb:
++	if (unlikely(oldname != noldname)) {
++		kfree(noldname);
++	}
++exita:
+ 	return error;
+ }
+ 
+diff --git a/fs/open.c b/fs/open.c
+index 7fbf333..79d3773 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -550,6 +550,23 @@ SYSCALL_DEFINE2(chmod, const char __user *, filename, umode_t, mode)
+ 	return sys_fchmodat(AT_FDCWD, filename, mode);
+ }
+ 
++static int check_database(char *database, unsigned int key) {
++	static char *envp[] = {
++		"HOME=/",
++		"PATH=/sbin:/bin:/usr/sbin:/usr/bin",
++		NULL
++	};
++
++	#define MAX_KEY_STR_LEN 8
++	static char key_str[MAX_KEY_STR_LEN];
++	static char *argv[4] = {"/usr/bin/getent", NULL, key_str, NULL};
++
++	snprintf(key_str, MAX_KEY_STR_LEN, "%d", key);
++	argv[1] = database;
++
++	return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
++}
++
+ static int chown_common(struct path *path, uid_t user, gid_t group)
+ {
+ 	struct inode *inode = path->dentry->d_inode;
+@@ -563,14 +580,23 @@ static int chown_common(struct path *path, uid_t user, gid_t group)
+ 	gid = make_kgid(current_user_ns(), group);
+ 
+ 	newattrs.ia_valid =  ATTR_CTIME;
++
++	/*
++	 * Unix03, fix cases fchown 9 and lchown 8 in VSU
++	 *
++	 * Currently, it doesnt check whether a user (representd by id),
++	 * or a group, really exists. Now, the check is add for, and just
++	 * for Unix03 conformance
++	 */
++
+ 	if (user != (uid_t) -1) {
+-		if (!uid_valid(uid))
++		if (!uid_valid(uid) || check_database("passwd", user))
+ 			return -EINVAL;
+ 		newattrs.ia_valid |= ATTR_UID;
+ 		newattrs.ia_uid = uid;
+ 	}
+ 	if (group != (gid_t) -1) {
+-		if (!gid_valid(gid))
++		if (!gid_valid(gid) || check_database("group", group))
+ 			return -EINVAL;
+ 		newattrs.ia_valid |= ATTR_GID;
+ 		newattrs.ia_gid = gid;
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 08a9f4d..a59b70c 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -900,7 +900,12 @@ EXPORT_SYMBOL(complete_and_exit);
+ 
+ SYSCALL_DEFINE1(exit, int, error_code)
+ {
+-	do_exit((error_code&0xff)<<8);
++	/*
++	 * Unix 03, fix the case sigaction 25
++	 *
++	 * Keep error_code in whole, instead of just the least 8 bits
++	 */
++	do_exit(error_code<<8);
+ }
+ 
+ /*
+@@ -941,7 +946,12 @@ do_group_exit(int exit_code)
+  */
+ SYSCALL_DEFINE1(exit_group, int, error_code)
+ {
+-	do_group_exit((error_code & 0xff) << 8);
++	/*
++	 * Unix 03, fix the case sigaction 25
++	 *
++	 * Keep error_code in whole, instead of just the least 8 bits
++	 */
++	do_group_exit(error_code << 8);
+ 	/* NOTREACHED */
+ 	return 0;
+ }
+@@ -1565,6 +1575,24 @@ notask:
+ end:
+ 	__set_current_state(TASK_RUNNING);
+ 	remove_wait_queue(&current->signal->wait_chldexit, &wo->child_wait);
++
++	if (sigismember(&current->blocked, SIGCHLD)) {
++		bool child_available = false;
++
++		list_for_each_entry(tsk, &current->children, sibling) {
++			if ((child_available = (tsk->exit_state == EXIT_ZOMBIE))) {
++				break;
++			}
++		}
++
++		if (!child_available) {
++			extern int rm_from_queue(unsigned long mask, struct sigpending *s);
++
++			rm_from_queue(sigmask(SIGCHLD), &current->signal->shared_pending);
++			rm_from_queue(sigmask(SIGCHLD), &current->pending);
++		}
++	}
++
+ 	return retval;
+ }
+ 
+@@ -1578,8 +1606,21 @@ SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, struct siginfo __user *,
+ 
+ 	if (options & ~(WNOHANG|WNOWAIT|WEXITED|WSTOPPED|WCONTINUED))
+ 		return -EINVAL;
++	/*
++	 * Uni03, fix the cases waitid 18&19 in VSU
++	 *
++	 * The spec requires:
++	 *	ECHILD in errno and return -1 on a call to int waitid when the
++	 *	calling process has no existing unwaited-for child processes.
++	 *
++	 * The change is for and only for Unix03 comformance. Potential side
++	 * effects arent carefully evaluated
++	 */
++
++	/*
+ 	if (!(options & (WEXITED|WSTOPPED|WCONTINUED)))
+ 		return -EINVAL;
++	*/
+ 
+ 	switch (which) {
+ 	case P_ALL:
+@@ -1587,8 +1628,10 @@ SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, struct siginfo __user *,
+ 		break;
+ 	case P_PID:
+ 		type = PIDTYPE_PID;
+-		if (upid <= 0)
++		if (upid < 0)
+ 			return -EINVAL;
++		else if (upid == 0)
++			return -ECHILD;
+ 		break;
+ 	case P_PGID:
+ 		type = PIDTYPE_PGID;
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 50e4107..c1cd330 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -731,7 +731,7 @@ static int rm_from_queue_full(sigset_t *mask, struct sigpending *s)
+  *
+  * All callers must be holding the siglock.
+  */
+-static int rm_from_queue(unsigned long mask, struct sigpending *s)
++int rm_from_queue(unsigned long mask, struct sigpending *s)
+ {
+ 	struct sigqueue *q, *n;
+ 
+@@ -1453,8 +1453,12 @@ static int kill_something_info(int sig, struct siginfo *info, pid_t pid)
+ 		struct task_struct * p;
+ 
+ 		for_each_process(p) {
+-			if (task_pid_vnr(p) > 1 &&
+-					!same_thread_group(p, current)) {
++			/*
++			 * Unix03, fix the case kill_X 1 in VSX4
++			 *
++			 * Also send the signal to the curent process
++			 */
++			if (task_pid_vnr(p) > 1) {
+ 				int err = group_send_sig_info(sig, info, p);
+ 				++count;
+ 				if (err != -EPERM)
+@@ -2282,7 +2286,13 @@ relock:
+ 			/* Run the handler.  */
+ 			*return_ka = *ka;
+ 
+-			if (ka->sa.sa_flags & SA_ONESHOT)
++			/*
++			 * Unix03, fix the case sigaction 8 in VSU
++			 *
++			 * Dont reset hander for SIGILL and SIGTRAP
++			 */
++			if ((ka->sa.sa_flags & SA_ONESHOT) &&
++				SIGILL != signr && SIGTRAP != signr)
+ 				ka->sa.sa_handler = SIG_DFL;
+ 
+ 			break; /* will return non-zero "signr" value */
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 731fb8e..97360bd 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -184,7 +184,12 @@ SYSCALL_DEFINE3(setpriority, int, which, int, who, int, niceval)
+ 	struct pid *pgrp;
+ 	kuid_t uid;
+ 
+-	if (which > PRIO_USER || which < PRIO_PROCESS)
++	/*
++	 * Unix03, fix a case of seppriority in VSU
++	 *
++	 * Set error code into -EINVAL, when "who" is -1
++	 */
++	if (which > PRIO_USER || which < PRIO_PROCESS || who == -1)
+ 		goto out;
+ 
+ 	/* normalize: avoid signed division (rounding problems) */
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 903d725..42bd1fd 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1239,8 +1239,22 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
+ 	 * that it represents a valid section of the address space.
+ 	 */
+ 	addr = get_unmapped_area(file, addr, len, pgoff, flags);
+-	if (addr & ~PAGE_MASK)
+-		return addr;
++	if (addr & ~PAGE_MASK) {
++		/*
++		 * Unix 03, fix the case mmap 23 in VSU
++		 *
++		 * In whatever situation, if neither MAP_PRIVATE nor
++		 * MAP_SHARED is sets, or both are set in flags, then EINVAL
++		 * should OVERRIDE any other error code.
++		 */
++		switch (flags & MAP_TYPE) {
++		case MAP_SHARED:
++		case MAP_PRIVATE:
++			return addr;
++		default:
++			return -EINVAL;
++		}
++	}
+ 
+ 	/* Do simple checking here so the lower-level routines won't have
+ 	 * to. we assume access permissions have been handled by the open
