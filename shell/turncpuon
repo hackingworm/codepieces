@@ -1,0 +1,46 @@
+#!/usr/bin/bash
+
+declare -i from to number end index
+
+read range < /sys/devices/system/cpu/present
+from=${range%-*}
+to=${range#*-}+1
+#echo "from $from, to $to"
+
+if (( 0 == $# ))
+then
+	number=$to-$from
+else
+	number=$1
+	if (( 1 > $number ))
+	then
+		echo "Usage: $0 [\"CPU number to be turned on, a positive integer\"]"
+		exit -1
+	fi
+fi
+#echo "number $number"
+
+end=$from+$number
+if (( $end > $to ))
+then
+	end=$to
+fi
+#echo "end $end";
+
+#echo "Switch on"
+index=$from+1
+while (( $index < $end ))
+do
+	#echo $index
+	echo 1 > /sys/devices/system/cpu/cpu$index/online
+	((++index))
+done
+
+#echo "index $index"
+#echo "Switch off"
+while (( $index < $to ))
+do
+	#echo $index
+	echo 0 > /sys/devices/system/cpu/cpu$index/online
+	((++index))
+done
